@@ -1,2 +1,5 @@
-target/
-client/target/
+/target
+/client/target
+/pkg
+.env
+.vercel

@@ -1,0 +1,6 @@
+target
+client/target
+pkg
+.git
+.env
+*.md

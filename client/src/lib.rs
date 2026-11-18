@@ -2,9 +2,11 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
+use wasm_bindgen_futures::{spawn_local, JsFuture};
 use web_sys::{
-    AudioContext, CanvasRenderingContext2d, Document, Element, HtmlCanvasElement, HtmlElement,
-    KeyboardEvent, OscillatorType, PointerEvent, TouchEvent, Window,
+    AudioContext, CanvasRenderingContext2d, Document, Element, Headers, HtmlCanvasElement,
+    HtmlElement, HtmlInputElement, KeyboardEvent, OscillatorType, PointerEvent, Request,
+    RequestInit, Response, TouchEvent, Window,
 };
 
 const CSS: &str = r#"
@@ -36,6 +38,13 @@ dt{color:var(--dim)} dd{margin:0;text-align:right;color:var(--c)}
 .btn{width:58px;height:58px;background:rgba(232,236,245,.06);border:0;color:var(--ink);font:inherit;font-size:24px;clip-path:polygon(9px 0,100% 0,100% calc(100% - 9px),calc(100% - 9px) 100%,0 100%,0 9px);box-shadow:inset 0 0 0 1px var(--c);touch-action:manipulation;cursor:pointer}
 .btn:active{background:var(--c);color:var(--bg)}
 .btn.wide{width:auto;padding:0 28px;height:46px;font-size:16px}
+#over{overflow:auto;padding:8px}
+#name{width:70%;max-width:220px;height:38px;padding:0 10px;background:rgba(232,236,245,.08);border:1px solid var(--c);color:var(--ink);font:inherit;font-size:16px;text-align:center;user-select:text;-webkit-user-select:text;touch-action:auto;border-radius:0;outline:none}
+#name:focus{box-shadow:0 0 12px rgba(0,229,255,.45)}
+#lb{margin:0;padding:0;list-style:none;width:80%;font-size:12px;color:var(--dim)}
+#lb li{display:flex;justify-content:space-between;gap:8px;padding:1px 0}
+#lb li span:last-child{color:var(--c)}
+.btn.wide[disabled]{opacity:.5}
 @media (prefers-reduced-motion:reduce){body::after,h1::before,h1::after,#over h2{animation:none}}
 "#;
 
@@ -59,6 +68,9 @@ const BODY_HTML: &str = r#"
     <div id="over" hidden>
       <h2>Стек переполнен</h2>
       <p id="final"></p>
+      <input id="name" maxlength="16" placeholder="Твой ник" autocomplete="off" autocapitalize="off" spellcheck="false">
+      <button class="btn wide" id="send" data-a="submit">В таблицу</button>
+      <ol id="lb"></ol>
       <button class="btn wide" data-a="reset">Ещё раз</button>
     </div>
   </div>
@@ -71,6 +83,75 @@ const BODY_HTML: &str = r#"
   </div>
 </main>
 "#;
+
+// ---------- сеть: рекорды через наш Axum API (fetch из Rust, без JS) ----------
+
+async fn api_get_scores(limit: u32) -> Result<Vec<(String, u32)>, JsValue> {
+    let win = web_sys::window().ok_or("no window")?;
+    let resp: Response =
+        JsFuture::from(win.fetch_with_str(&format!("/api/scores?limit={limit}"))).await?.dyn_into()?;
+    if !resp.ok() {
+        return Err(JsValue::from_str("scores: http error"));
+    }
+    let json = JsFuture::from(resp.json()?).await?;
+    let mut out = Vec::new();
+    for item in js_sys::Array::from(&json).iter() {
+        let name = js_sys::Reflect::get(&item, &"name".into())?.as_string().unwrap_or_default();
+        let score = js_sys::Reflect::get(&item, &"score".into())?.as_f64().unwrap_or(0.0) as u32;
+        out.push((name, score));
+    }
+    Ok(out)
+}
+
+async fn api_post_score(name: &str, score: u32, lines: u32, level: u32) -> Result<u32, JsValue> {
+    let win = web_sys::window().ok_or("no window")?;
+    let obj = js_sys::Object::new();
+    js_sys::Reflect::set(&obj, &"name".into(), &name.into())?;
+    js_sys::Reflect::set(&obj, &"score".into(), &score.into())?;
+    js_sys::Reflect::set(&obj, &"lines".into(), &lines.into())?;
+    js_sys::Reflect::set(&obj, &"level".into(), &level.into())?;
+    let body = js_sys::JSON::stringify(&obj)?;
+
+    let headers = Headers::new()?;
+    headers.set("Content-Type", "application/json")?;
+    let init = RequestInit::new();
+    init.set_method("POST");
+    init.set_headers(&headers);
+    init.set_body(&body);
+    let req = Request::new_with_str_and_init("/api/scores", &init)?;
+
+    let resp: Response = JsFuture::from(win.fetch_with_request(&req)).await?.dyn_into()?;
+    if !resp.ok() {
+        return Err(JsValue::from_str("submit: http error"));
+    }
+    let json = JsFuture::from(resp.json()?).await?;
+    Ok(js_sys::Reflect::get(&json, &"rank".into())?.as_f64().unwrap_or(0.0) as u32)
+}
+
+/// Рисует топ в <ol id="lb"> через text_content (никакого innerHTML — нет XSS).
+fn render_leaderboard(doc: &Document, rows: &[(String, u32)]) {
+    let Some(ol) = doc.get_element_by_id("lb") else { return };
+    ol.set_text_content(None);
+    for (i, (name, score)) in rows.iter().enumerate() {
+        if let (Ok(li), Ok(a), Ok(b)) =
+            (doc.create_element("li"), doc.create_element("span"), doc.create_element("span"))
+        {
+            a.set_text_content(Some(&format!("{}. {}", i + 1, name)));
+            b.set_text_content(Some(&score.to_string()));
+            let _ = li.append_child(&a);
+            let _ = li.append_child(&b);
+            let _ = ol.append_child(&li);
+        }
+    }
+}
+
+fn refresh_leaderboard(doc: Document) {
+    spawn_local(async move {
+        if let Ok(rows) = api_get_scores(5).await {
+            render_leaderboard(&doc, &rows);
+        }
+    });
+}
 
 fn mount_ui(doc: &Document) -> Result<(), JsValue> {
     if let Some(head) = doc.head() {
@@ -312,12 +393,48 @@ impl Game {
         self.el("final").set_text_content(Some(&format!("Счёт {}, рекорд {}", self.score, self.best)));
         self.el("over").set_hidden(false);
         self.hud();
+        // подставляем последний ник и подтягиваем таблицу
+        if let Some(n) = self.win.local_storage().ok().flatten().and_then(|s| s.get_item("fsn").ok().flatten()) {
+            if let Some(inp) = self.doc.get_element_by_id("name").and_then(|e| e.dyn_into::<HtmlInputElement>().ok()) {
+                if inp.value().is_empty() { inp.set_value(&n); }
+            }
+        }
+        refresh_leaderboard(self.doc.clone());
+    }
+
+    fn submit(&mut self) {
+        if !self.over || self.score == 0 { return; }
+        let Some(inp) = self.doc.get_element_by_id("name").and_then(|e| e.dyn_into::<HtmlInputElement>().ok()) else { return };
+        let name = inp.value().trim().to_string();
+        let name = if name.is_empty() { "anon".to_string() } else { name };
+        if let Ok(Some(st)) = self.win.local_storage() { let _ = st.set_item("fsn", &name); }
+
+        let btn = self.el("send");
+        let _ = btn.set_attribute("disabled", "");
+        btn.set_text_content(Some("..."));
+        let (score, lines, level, doc) = (self.score, self.lines, self.level, self.doc.clone());
+        spawn_local(async move {
+            match api_post_score(&name, score, lines, level).await {
+                Ok(rank) => {
+                    btn.set_text_content(Some(&format!("Место #{rank} ✓")));
+                    if let Ok(rows) = api_get_scores(5).await { render_leaderboard(&doc, &rows); }
+                }
+                Err(_) => {
+                    btn.set_text_content(Some("Ошибка, ещё раз"));
+                    let _ = btn.remove_attribute("disabled");
+                }
+            }
+        });
     }
 
     fn reset(&mut self) {
         self.board = [[0; W]; H]; self.score = 0; self.level = 1; self.lines = 0;
         self.drop = 700.0; self.acc = 0.0; self.over = false; self.parts.clear(); self.flash.clear();
-        self.el("over").set_hidden(true); self.nxt = self.take(); self.spawn(); self.hud();
+        self.el("over").set_hidden(true);
+        let btn = self.el("send");
+        let _ = btn.remove_attribute("disabled");
+        btn.set_text_content(Some("В таблицу"));
+        self.nxt = self.take(); self.spawn(); self.hud();
     }
 
     fn hud(&self) {
@@ -423,7 +540,7 @@ impl Game {
     }
 
     fn action(&mut self, name: &str) {
-        match name { "left" => self.mv(-1), "right" => self.mv(1), "soft" => self.soft(), "hard" => self.hard(), "turn" => self.turn(), "reset" => self.reset(), _ => {} }
+        match name { "left" => self.mv(-1), "right" => self.mv(1), "soft" => self.soft(), "hard" => self.hard(), "turn" => self.turn(), "reset" => self.reset(), "submit" => self.submit(), _ => {} }
     }
 }
 
@@ -443,6 +560,8 @@ pub fn main() -> Result<(), JsValue> {
     {
         let g = game.clone();
         let cb = Closure::<dyn FnMut(KeyboardEvent)>::new(move |e: KeyboardEvent| {
+            // печатаем ник — пробел, стрелки и «r» не должны управлять игрой
+            if e.target().map_or(false, |t| t.dyn_ref::<HtmlInputElement>().is_some()) { return; }
             let act = match e.key().as_str() { "ArrowLeft" => Some("left"), "ArrowRight" => Some("right"), "ArrowDown" => Some("soft"), "ArrowUp" => Some("turn"), " " => Some("hard"), "r" | "R" => Some("reset"), _ => None };
             if let Some(a) = act { e.prevent_default(); g.borrow_mut().action(a); }
         });

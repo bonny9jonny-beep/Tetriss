@@ -9,11 +9,17 @@ crate-type = ["cdylib"]
 [dependencies]
 wasm-bindgen = "0.2"
 js-sys = "0.3"
+wasm-bindgen-futures = "0.4"
 web-sys = { version = "0.3", features = [
   "Window", "Document", "Element", "HtmlElement", "HtmlHeadElement",
   "HtmlCanvasElement", "CanvasRenderingContext2d", "DomTokenList",
   "Storage", "Navigator", "AudioContext", "OscillatorNode",
   "OscillatorType", "GainNode", "AudioParam", "AudioDestinationNode",
-  "EventTarget", "KeyboardEvent", "PointerEvent", "TouchEvent",
+  "EventTarget", "KeyboardEvent", "HtmlInputElement",
+  "Request", "RequestInit", "Response", "Headers", "PointerEvent", "TouchEvent",
   "TouchList", "Touch", "MediaQueryList", "NodeList"
 ] }
+
+[profile.release]
+opt-level = "s"
+lto = true
